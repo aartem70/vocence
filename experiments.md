@@ -241,3 +241,85 @@ This pushed us to:
   converge for codec-LM TTS.
 - Trait-side optimization (script/gender/age): we already score 0.95+
   on those; the marginal weighted-score gain is below judge noise.
+
+---
+
+## 2026-05-08 → 2026-05-09 — DPO/MPO + canonical-eval audit (N=100, validator-faithful)
+
+All numbers below use a validator-faithful canonical eval pipeline (N=100, single-candidate generation with the model's own `generation_config.json` defaults: `temp=0.9, top_p=1.0, top_k=50, repetition_penalty=1.05`, no postproc, no picker, single-order GPT-4o-audio judging — exact mirror of `vocence/pipeline/evaluation.py`). The earlier `local_eval_fast.py` driver was found to bias scores ~3× downward for everyone (incl. magma) due to a `--symmetric` flag and a `qwen_batched.py` temperature ladder.
+
+Reference points on canonical eval:
+- magma_v8: **0.430** win, 0.620 naturalness
+- v5 RFT (avg_last2): **0.380** win, 0.470 naturalness
+
+### Eval pipeline audit
+
+a) **Motivation:** Local fast-eval kept reporting our models in the 0.12–0.20 win-rate range while the live leaderboard had top miners around 0.60–0.65. Either the model was much worse than expected, or the local eval was lying. We wanted to know which.
+
+b) **Method:** Diff `local_eval_fast.py` + `qwen_batched.py` against the validator's `vocence/pipeline/evaluation.py` line-by-line. Re-run magma_v8's chute under both pipelines on identical specs.
+
+c) **Result:** Three orthogonal logic divergences in fast-eval, none required for the speedup itself:
+- `qwen_batched.py` overrode sampling to `top_p=0.92, repetition_penalty=1.10` and ran a temperature ladder (0.7/0.85/1.0), differing from validator-implied defaults (`top_p=1.0, rep=1.05, temp=0.9`).
+- `--symmetric` zeroed the naturalness component on judge-disagreed pairs (validator does single random-order judging).
+- `CompositeScorer` (`0.7·intelligibility + 0.3·UTMOSv2`) post-filtered candidates against an objective uncorrelated with GPT-4o naturalness.
+Magma went from **0.20 → 0.43** under canonical pipeline. v5 RFT went from **0.12 → 0.38**. Conclusion: the speedup (sharding + asyncio) is fine; the logic changes were not. Patched `qwen_batched.py` to canonical defaults and stopped using `--symmetric`.
+
+### DPO+NVR v1 (deployed, prior result reconfirmed)
+
+a) **Motivation:** Reproduce the previously trained DPO+NVR checkpoint under the corrected eval to anchor a baseline.
+
+b) **Method:** Eval `dpo_nvr_out/avg_last1` (282 NVR pairs, harvested from v5 RFT, β=0.01, lr=2e-7) at N=100 canonical.
+
+c) **Result:** **0.460 win rate, 0.580 naturalness, 0.876 weighted.** +8 pp on win rate over v5 RFT, mostly from the +0.11 naturalness lift the DPO step bought. Confirms NVR-Prosody DPO (arXiv:2509.18531) is doing real work at our scale.
+
+### DPO v2 — combine v1 (RFT-source) + v2 (DPO+NVR-source) + LESS prune
+
+a) **Motivation:** Test whether iterative on-policy DPO (Koel-TTS-style "rolling reference") lifts past v1's 0.460 once we feed in fresh pairs harvested from the v1 model itself.
+
+b) **Method:** Harvested 250 specs (~64 NVR pairs after both-orders-agreed filter) from DPO+NVR v1, combined with the existing 282 v1 pairs → 346 pairs. Pruned to top-50% by LESS task-feature similarity to currently-losing held-out specs (`less_score_pairs.py` proxy — full LoRA-grad LESS was out of scope) → 173 pairs. Trained DPO from the v1 checkpoint, 2 epochs, β=0.01, lr=2e-7.
+
+c) **Result:** **0.470 win rate, 0.560 naturalness, 0.861 weighted.** +1pp on win rate, –2pp naturalness — within ±5pp N=100 noise. Statistically a tie. Larger dataset alone didn't move the needle when half the pairs were on-policy.
+
+### MPO mixed-source
+
+a) **Motivation:** With DPO loss component flat at ~0.69 (≈ ln 2, no preference signal moving) on the 173-pair set, suspect DPO at this scale is policy-collapse-prone. Try MPO (DPO + length-norm + α=10·CE on chosen) which is documented to regularize exactly this failure mode.
+
+b) **Method:** Same 173-pair LESS-pruned set, warm-started from `dpo_nvr_out/avg_last1`. β=0.05, lr=1e-6, α-dpo=10, length-norm on, 3 epochs (per `mpo_12hz.py` defaults from arXiv:2509.00685 + Qwen3-TTS issue #39).
+
+c) **Result:** **0.490 win rate, 0.630 naturalness, 0.885 weighted.** +3pp on win rate AND +5pp on naturalness over DPO-v1. The CE auxiliary kept absolute likelihood of the chosen sequences high while the (small) DPO term still gave a margin signal. Naturalness gain — the actual subnet bottleneck — is what mattered. **Best confirmed at this stage.**
+
+### v3 — iterative MPO on on-policy pairs from MPO itself
+
+a) **Motivation:** v1 had taught us scaling NVR pairs by ~2× didn't help, but the recipe was DPO. With MPO now working at 173 pairs, retest the scaling question. Harvest 1000 specs on-policy from the MPO checkpoint, combine v1+v2+v3 (595 pairs raw → 297 after LESS), warm-start MPO from MPO again, 3 epochs.
+
+b) **Method:** Same MPO hyperparams. New harvest: 1000 specs from MPO ckpt (~$240 GPT-4o-audio, ~5 h, 4-shard). Build NVR pairs (199 specs with both winner and loser → 249 raw pairs). Combine with prior 346 → 595, LESS top-50% → 297. Train.
+
+c) **Result:** **0.370 win rate (–12pp), 0.530 naturalness (–10pp).** Catastrophic regression. Every single pair came from MPO_output_A vs MPO_output_B; the model amplified MPO's existing biases (gender +3pp) at the expense of weaknesses (naturalness –10pp). Classic on-policy DPO collapse. The DPO component of the loss stayed at ~0.69 throughout — only the CE auxiliary moved, meaning we were essentially doing SFT-on-chosen with no preference contrast.
+
+### MPO v1-source — fresh train from RFT on RFT-source pairs only
+
+a) **Motivation:** v3's collapse pinpointed the issue as harvest-source, not data volume or recipe. Test the smallest possible variant of "harvest from a different policy than the one we're improving": just train MPO from the v5 RFT checkpoint (no warm-start from prior MPO) on the original v1 pairs (200 RFT-source pairs we already had encoded).
+
+b) **Method:** No new harvest. Reused `nvr_dpo_train.jsonl` (200 pairs from v5-RFT-era harvest). Trained MPO from `sft_out_rft/avg_last2` (NOT warm-started from MPO). Same hyperparams as MPO above. ~5 min training.
+
+c) **Result:** **0.520 win rate, 0.620 naturalness, 0.884 weighted. NEW BEST.** +3pp over MPO mixed-source (0.490) and +6pp over magma_v8 on the canonical eval. Confirms iterative-DPO collapse hypothesis: training from a fresh policy on data harvested from a *different* fresh policy is structurally better than warm-starting from the policy whose data you're using. The simpler recipe with less data wins.
+
+### v4 (in progress) — harvest from Qwen3-TTS base for max source diversity
+
+a) **Motivation:** v1-source proved harvest-policy diversity matters. Owner base model (`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`) is the maximally different policy from anything we've trained — no fine-tuning at all. If preferences mined from base + RFT pairs together beat 0.520, we have a recipe for further scale-up.
+
+b) **Method:** Download the actual Qwen3-TTS base (4.3 GB; the owner's HF stub `concil859856/qwen3-voicedesign-base` ships without weights). Harvest 500 specs from base, expecting ~95 NVR pairs after agreement filter. Combine with 200 RFT-source pairs → ~295 mixed-source. Train MPO from v5 RFT for 3 epochs, no LESS pruning (LESS proxy hurt v3 by keeping the noisiest pairs). N=100 canonical eval.
+
+c) **Result:** Pending — harvest at ~80% as of writing. Hypothesis: if mixed-source ≥ 0.55, we have a clear recipe-direction; if it's flat near 0.520, the diversity per se isn't the lever and we move to KTO / IPO.
+
+## Operational lesson (not a model experiment, but cost us 6+ hours)
+
+a) **Motivation:** New miner deploys (post chutes platform policy change ~2026-05-07) must be private + TEE + shared with the validator's chutes user. New accounts can no longer create public chutes.
+
+b) **Method:** After two failed deploys ending in `chute_not_running` despite a valid model and successful HF push, dumped the encrypted startup logs from the chutes platform (`GET /encrypted_logs/{id}/sessions` + `/chunks`).
+
+c) **Result:** Two distinct failure modes uncovered:
+- **Top-level torch import**: `miner.py` imported `torch` and `qwen_tts` at module level. This runs **inside** the canonical wrapper's `vocence_load_tts_engine` import sandbox, and torch.distributed lazily creates `/tmp/tmpXXXX/_remote_module_non_scriptable.py`, which the sandbox rejects. Fix: lazy-import torch/qwen_tts inside `_build_model()`, called from `warmup()` (which runs *after* the sandbox is removed).
+- **`shutdown_after_seconds`**: defaulting to 10000 (~2.8 h) caused the chute to scale to 0 between validator-eval bursts, then fail to reclaim a `pro_6000` slot from the contended pool, oscillating the miner between Valid and Invalid status. All working SN78 miners use `86400` (24 h). With that set, the instance never lets go of its GPU slot.
+- **Commit-cap gotcha**: SN78 caps each hotkey to 2 valid on-chain commits after block 8,081,000. Our first hotkey burned 3 commits while we sanitized HF history, permanently locking it out of the dashboard regardless of model quality. Future deploys: minimize commits per hotkey.
+
