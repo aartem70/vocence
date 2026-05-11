@@ -323,3 +323,90 @@ c) **Result:** Two distinct failure modes uncovered:
 - **`shutdown_after_seconds`**: defaulting to 10000 (~2.8 h) caused the chute to scale to 0 between validator-eval bursts, then fail to reclaim a `pro_6000` slot from the contended pool, oscillating the miner between Valid and Invalid status. All working SN78 miners use `86400` (24 h). With that set, the instance never lets go of its GPU slot.
 - **Commit-cap gotcha**: SN78 caps each hotkey to 2 valid on-chain commits after block 8,081,000. Our first hotkey burned 3 commits while we sanitized HF history, permanently locking it out of the dashboard regardless of model quality. Future deploys: minimize commits per hotkey.
 
+
+## 2026-05-10 → 2026-05-11 — Eval rigor + on-policy MPO failures + first working DPO (source-clip)
+
+### Reproducibility test — judge noise quantified
+
+a) **Motivation:** Prior K=1 N=100/300 evals produced inconsistent rankings (v1-source measured as 0.520 / 0.430 / 0.387 across three runs of the *same* model). Wanted to characterize the true noise floor before trusting any training-induced delta.
+
+b) **Method:** Ran the same 20 specs × 5 trials on v1-source MPO. Same model, same prompts, same canonical sampling (T=0.9, top_p=1.0, top_k=50, rep_pen=1.05).
+
+c) **Result:** Only **4 of 20 specs gave the same verdict in all 5 trials**. 16 of 20 flipped at least once; some weighted scores swung 0.74→1.00 across runs on the same spec. The model is stochastic at T=0.9, audio differs every call; judge gives consistent answers to inconsistent inputs. Single-trial K=1 evals are essentially unusable for differences <5pp.
+
+### Paired N=200 K=3 eval harness
+
+a) **Motivation:** Need a statistically-sound A-vs-B harness to evaluate training experiments at the 1pp resolution we operate in. Single-trial inadequate; need K-trial averaging + paired analysis.
+
+b) **Method:** `eval_paired.py` + `run_paired.sh` + `analyze_paired.py`. For each spec, K=3 batched candidates per model, pointwise + single-order pairwise judge per candidate. Per-spec mean(weighted) over K trials; paired t-test on per-spec deltas across N=200 specs. Two models in parallel (cuda:0,1 vs cuda:2,3), `--judge-concurrency 16`.
+
+c) **Result:** Wall ~30 min for 2 models, ~$48 OpenAI cost per A-vs-B comparison, **±0.011 95% CI on mean_weighted** (~1pp detection limit). Recipe locked in memory as the default for any future ranking decision.
+
+### 4-way paired baseline at K=3, n=189
+
+a) **Motivation:** Re-establish ranking with the new harness. Prior K=1 numbers had ~6pp inherent noise, the wrong scale for the gaps we care about.
+
+b) **Method:** Pair-1 (RFT base vs v1-source MPO) + Pair-2 (v6 MPO vs magma v8). Same `--seed 42` specs, cross-join by clip_id for full 4-way comparison.
+
+c) **Result:** **The ranking we believed was wrong.**
+
+| Model | weighted | nat | win |
+|---|---:|---:|---:|
+| RFT base | 0.883 | 0.741 | 0.528 |
+| v6 MPO | 0.883 | 0.744 | 0.501 |
+| v1-source MPO | 0.875 | 0.712 | 0.490 |
+| magma v8 | 0.869 | 0.703 | 0.455 |
+
+RFT and v6 are statistically tied (t=0.09); both **statistically beat magma** (RFT−magma t=2.58, v6−magma t=2.47, both p<0.05). Our prior claim that magma was ahead of us was K=1 noise. The v1-source MPO step we ran weeks ago never lifted over RFT base.
+
+### Loss decomposition
+
+a) **Motivation:** Aggregate score-chasing was hitting noise. Wanted to know WHICH elements drive losses to find an actionable training target.
+
+b) **Method:** Bucketed all 184 losses from v1-source n=300 eval into: broken outputs, naturalness-only losses, multi-element failures. Built confusion matrices for perceived-vs-spec gender and accent.
+
+c) **Result:** 7% broken outputs (silent/garbled — common to all miners at ~4%, not differentiating), **40% naturalness-only** (judge picks source despite all traits matching — the "coin-flip zone" from the repro test), **48% multi-element failures** dominated by gender + accent mismatches. Critical finding: **"neutral" trait conditioning is broken** — gender=neutral hits 39% perceived accuracy, accent=neutral hits only 15%, while strong-trait specs (UK 90%, US 74%, male 81%, female 74%) are fine. The model defaults to male/UK/US instead of producing genuinely neutral voices.
+
+### v6 — judge-verified naturalness MPO (FAILED)
+
+a) **Motivation:** Lift naturalness by harvesting K=5 candidates per spec from v1-source, using symmetric pairwise judging (both audio orders agree) to label preference pairs — the cleanest possible naturalness signal.
+
+b) **Method:** 300 specs × K=5 from `specs_train`, symmetric pairwise GPT-4o-audio judging → 240 NVR-style pairs (lost $120 on a first attempt where I forgot `--audio-out-dir`; re-harvested). MPO from v1-source 3 epochs, β=0.05, lr=1e-6, α-dpo=10.
+
+c) **Result:** **DPO loss stayed at log(2)≈0.693 throughout training.** The model couldn't differentiate chosen vs rejected at all. Eval: tied with v1-source. Mechanism diagnosis: chosen and rejected come from the *same* model at the *same* sampling, just different stochastic draws — token sequences are too similar despite GPT perceiving them differently. The α·CE term contributed weights movement but no preference signal.
+
+### v7 — trait-match MPO (FAILED)
+
+a) **Motivation:** Pivot from noisy naturalness to a cleaner signal — judge-extracted gender/accent/age traits. Pointwise classification noise (~15%) is much lower than pairwise naturalness coin-flip noise (~50%). Target the "neutral conditioning" failure specifically.
+
+b) **Method:** 500 specs × K=5 from RFT base, pointwise judging per candidate. Pairs: chosen = candidate where all 7 traits match spec, rejected = candidate where ≥2 traits mismatch. **590 training pairs** (2.5× v6). MPO from RFT, same hyperparams.
+
+c) **Result:** **DPO loss stayed at log(2) again.** Paired eval v7 vs RFT base (N=200 K=3): Δ +0.005 mean_weighted (NS, t=1.31). The label quality was much higher but the *mechanism* still failed — on-policy DPO from same-model samples can't extract gradient regardless of label noise, because the chosen and rejected token sequences are simply too close in the model's own distribution.
+
+### v8 — source-clip DPO (FIRST WORKING DPO)
+
+a) **Motivation:** v6 + v7 conclusively ruled out on-policy MPO. Need off-policy pairs — chosen and rejected from genuinely different distributions, not different stochastic samples of the same one. Real human source clips are the cleanest "different distribution" available, and we don't need any judge calls to label them ("source > model" is by construction).
+
+b) **Method:** 1000 specs from `specs_train` (--seed 13). Generate one RFT output per spec; re-encode both source clips and model audio via `prepare_data.py` (Qwen3-TTS-Tokenizer-12Hz). Merge into MPO format with chosen=source codes, rejected=model codes. Train MPO from RFT base, 3 epochs. ~$0 in judge calls.
+
+c) **Result:** **First training run where DPO loss actually moved.** Dropped from 0.6931 to 0.6836 over 3 epochs — small but real, sustained gradient. Paired eval v8 vs RFT (N=200 K=3): **mean_weighted +0.0111** (95% CI ±0.0115, t=1.90 — *just* below the 1.96 significance threshold). Per-element breakdown reveals the lift came from emotion (+7.1pp), script (+1.65pp), tone (+2pp) — NOT naturalness (−0.35pp). Source-clip pairs teach phonetic articulation and emotional expressivity, but don't directly close the naturalness gap. **v8 became our highest-measured model** and beats magma comfortably.
+
+### v9 — scale source-clip DPO to 2000 pairs
+
+a) **Motivation:** Test if the working v8 recipe scales linearly. If +0.011 at 1000 pairs becomes +0.020+ at 2000, we have a recipe for further scale-up. If it plateaus, we know we've hit diminishing returns on this recipe and need a different mechanism.
+
+b) **Method:** 2000 specs (--seed 17), same gen+encode pipeline. Full pipeline ~6h wall (gen ~4.2h, encode ~30min, train ~30min, paired eval v9 vs v8 ~60min). No judge cost beyond the final eval (~$48).
+
+c) **Result:** v9 trends slightly above v8 but no metric clears 95% significance — mean_weighted Δ +0.003 (NS), naturalness +0.024 (NS, t=1.06), win rate +0.030 (NS, t=1.29). **Diminishing returns on this recipe at ~1-2k pairs.** Next gain likely needs a different mechanism: acoustic refinement, curated higher-quality source pairs (only sources matching their own spec well), or multi-objective training with both source-clip and judge-verified signals.
+
+### Operational — chute auto-deletion
+
+a) **Motivation:** Get our miner serving on chutes.ai so the validator can score it. We had been on UID 213 with model committed at `artur7236/vocence-tts-v1`, deploying via the chutes CLI.
+
+b) **Method:** Iterated through several chute images. First deploy hit `/speak` failures from blocked external connections (HF Hub telemetry, transformers version-check pings). Rebuilt with `TRANSFORMERS_OFFLINE=1` + `HF_HUB_OFFLINE=1` + `HF_DATASETS_OFFLINE=1` env vars and `local_files_only=True` on `from_pretrained` to suppress them at source (NOT enabling `allow_external_egress`, which gets miners banned per SN78 owner rules). Cu128c image built and deployed at version `fcd35185` carrying v8 weights.
+
+c) **Result:** Chute sat cold for >12 hours with bounty climbing 1414 → 6500 and no GPU host claiming. **Chutes platform auto-deleted the chute** while we waited. Pending advice from SN78 / chutes support team on why allocation is stuck for our specific config (pro_6000 + tee:true + TEE chute) before redeploying.
+
+## Summary
+
+Built a statistically-rigorous paired eval harness (N=200, K=3, ±1pp CI on mean_weighted) and used it to debunk our K=1 ranking — RFT base ties our best MPO checkpoints and **statistically beats magma**, while v1-source MPO never actually lifted. Loss decomposition revealed "neutral" trait conditioning is broken (gender 39%, accent 15% accuracy on neutral specs), but v6/v7 MPO experiments targeting these failed identically — DPO loss stayed flat at log(2) because on-policy same-model pairs are too similar at the codec level regardless of label source. The breakthrough was **v8: source-clip DPO** (chosen = re-encoded human speech, rejected = model output) — first run where DPO loss actually dropped, with +0.011 mean_weighted vs RFT (t=1.90 borderline), driven by emotion (+7.1pp) and script (+1.65pp), not naturalness. v9 scaled to 2000 pairs added marginal lift only, suggesting diminishing returns on this recipe — the next gain likely needs a different mechanism (curated higher-quality source pairs, multi-objective training, or acoustic-level refinement rather than token-level DPO).
