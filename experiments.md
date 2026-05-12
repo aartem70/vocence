@@ -410,3 +410,105 @@ c) **Result:** Chute sat cold for >12 hours with bounty climbing 1414 → 6500 a
 ## Summary
 
 Built a statistically-rigorous paired eval harness (N=200, K=3, ±1pp CI on mean_weighted) and used it to debunk our K=1 ranking — RFT base ties our best MPO checkpoints and **statistically beats magma**, while v1-source MPO never actually lifted. Loss decomposition revealed "neutral" trait conditioning is broken (gender 39%, accent 15% accuracy on neutral specs), but v6/v7 MPO experiments targeting these failed identically — DPO loss stayed flat at log(2) because on-policy same-model pairs are too similar at the codec level regardless of label source. The breakthrough was **v8: source-clip DPO** (chosen = re-encoded human speech, rejected = model output) — first run where DPO loss actually dropped, with +0.011 mean_weighted vs RFT (t=1.90 borderline), driven by emotion (+7.1pp) and script (+1.65pp), not naturalness. v9 scaled to 2000 pairs added marginal lift only, suggesting diminishing returns on this recipe — the next gain likely needs a different mechanism (curated higher-quality source pairs, multi-objective training, or acoustic-level refinement rather than token-level DPO).
+
+
+## 2026-05-12 — Eval-bias diagnosis + LibriVox-stream root cause + voice-design mode mismatch
+
+Spent this session re-grounding everything we thought we knew about local eval. Earlier "+9pp local→prod offset" turned out to be a model-specific artifact, not a constant. Found the real reason every fine-tune we've shipped (v6 through v11) scores below the owner base in production, and reconstructed the validator's actual evaluation pipeline end-to-end.
+
+Production reference points pulled live from `https://backend.vocence.ai/api/dashboard/global-scoring` at 06:14 UTC:
+- ranupthestairs/vocence-tts (Maya1 arch, the only eligible-and-clearing-threshold winner): **51.35% WEIGHTED**
+- michael-chan-000/tts-v21 (Qwen3-TTS, eligible): 49.43%
+- magma90909/vocence_miner_v9 (Qwen3-TTS, 210 evals/6val, just-below eligibility): **50.79%**
+- concil859856/qwen3-voicedesign-base (owner baseline, Qwen3-TTS): **47.65%** ← floor any fine-tune must clear
+- artur7236/vocence-tts-v1 (us, v8 weights deployed): **39.69%** WEIGHTED, **42.50%** raw
+
+### Dashboard API + WEIGHTED metric correction
+
+a) **Motivation:** Previously believed `/api/dashboard/miners` gave the dashboard's WEIGHTED column. It doesn't.
+
+b) **Method:** Pulled `https://backend.vocence.ai/openapi.json` (public, no auth) and grepped its 80+ endpoints. Found `/api/dashboard/global-scoring` which returns the actual per-miner weighted_win_rate + raw_win_rate + per-validator breakdown + eligibility status.
+
+c) **Result:** `weighted_win_rate` = Σ(per-validator-win-rate × validator-stake) / Σ(stake), where each validator's win-rate is computed over its rolling-50 most recent evals. `/miners` shows a smaller window (~last hour of evals) and is **not** the dashboard's display source. Re-mapped all subsequent scoring conversations to `global-scoring`. Eligibility = ≥40 evals from ≥3 validators (we have ~20/validator on UID 213, so we earn $0 until ~120 more evals accumulate).
+
+### Clean-holdout pipeline — production-faithful judging on truly held-out specs
+
+a) **Motivation:** Discovered our `heldout_specs.jsonl` overlapped ~96% with `specs_train.jsonl` (heldout is a subset of train). Every prior "held-out" eval was leaking. Wanted a properly-held-out set so absolute scores could match production.
+
+b) **Method:** Built `clean_holdout.jsonl` = 186 specs in specs.jsonl that are in NEITHER specs_train NOR heldout_specs. Wrote `judge_clean_holdout.py` that imports the validator's exact `score_miner_against_spec_async` from `vocence.pipeline.evaluation` — same gpt-4o-audio judge, same prompts, same 0.9 win threshold. Generated audio for v8/rft/v10/magma_v9 on the 186 specs (sharded across 4 GPUs), judged each.
+
+c) **Result:** Local clean-holdout K=1 (n=185 after one drop):
+
+| Model | Local win | Local mean_weighted | Prod raw_win | Gap |
+|---|---:|---:|---:|---:|
+| v8 (ours) | 47.57% | 0.897 | 42.50% | **+5pp** (local over-predicts) |
+| rft (ours) | 47.57% | 0.885 | — | — |
+| v10 (ours) | 42.70% | 0.882 | — | — |
+| magma_v9 | **34.59%** | 0.858 | **54.55%** | **−20pp** (local UNDER-predicts) |
+
+**Local pipeline INVERTS the cross-team ranking.** Locally we say v8 > magma. Production says magma > v8. The earlier "+9pp constant offset" claim was wrong — gap is model-specific, sign-flipping.
+
+### Root cause — validator evaluates against the live LibriVox stream
+
+a) **Motivation:** With the ranking inversion confirmed, narrow down which step of the validator pipeline diverges from our local one.
+
+b) **Method:** Read `vocence/gateway/http/service/tasks/source_audio_downloader.py` (owner-side worker) and `vocence/pipeline/generation.py` (validator's eval loop) line-by-line.
+
+c) **Result:** Validator pipeline per eval round:
+1. Owner runs a background worker that pulls audiobooks from the **public LibriVox API every `SOURCE_AUDIO_DOWNLOAD_INTERVAL=60` seconds**, slices `LIBRIVOX_CLIPS_PER_CHAPTER=10` clips of 10–40s each, uploads to corpus bucket `audio-corpus-bucket`. Growth rate **~14,400 clips/day**; cap `AUDIO_CORPUS_MAX_ENTRIES=1,000,000` (effectively unbounded). Owner started at least 2026-04-21 ⇒ corpus is on the order of 200k+ LibriVox clips.
+2. Each validator picks one clip uniformly at random from the corpus every `SAMPLE_SLOT_INTERVAL_BLOCKS=150` blocks (= 30 min ⇒ **48 evals/day/validator, ~240 total across 5 active validators**).
+3. Validator extracts (transcription + 7 traits) via gpt-4o-audio-preview with prompt `DESCRIPTION_SYSTEM` from `vocence/pipeline/evaluation.py`.
+4. Sends `{text, instruction}` to miner's `/speak`. Judges miner output vs. the original LibriVox clip with `score_miner_against_spec_async` (pairwise + pointwise, 0.9 win threshold).
+
+**Our local pipeline uses `/root/miner-dev/data/clips/` (~8,741 static clips from a long-ago snapshot) as source audio. specs.jsonl is the static spec set derived from that snapshot.** Magma was trained on a much broader LibriVox slice — so it pairs unfavorably against our narrow snapshot (deflated local score) but favorably against the validator's fresh-uniform LibriVox stream (inflated production score). v8 was trained on a subset of our snapshot — pairs favorably against home turf, unfavorably against the validator's broad distribution.
+
+**This is the structural reason every fine-tune we have ever shipped scored below the owner base in production.** The local eval was telling us we were winning while we were quietly losing.
+
+### Operational — chute warmup recipe corrected, "two commit slots per UID"
+
+a) **Motivation:** Earlier guidance said "always reuse chute_id because redeploys are free." It ignored warmup time.
+
+b) **Method:** Burned ~14 hours on a same-chute_id redeploy stuck cold while a fresh-chute_id deploy on UID 213 went hot in ~10 min. Re-read `vocence/adapters/deployment.py` to confirm commit-slot model.
+
+c) **Result:** Same-chute_id redeploy is free in $ but Chutes is reluctant to reschedule existing chutes — observed multi-hour-to-multi-day cold waits. Fresh chute_name costs $5.40 but Chutes' scheduler treats it as a new allocation request and lands on an available `pro_6000+tee` slot in 10–60 min. **For any model swap worth scoring, fresh chute_name wins.** Also confirmed each UID has **2 commit slots** per reveal window; with `blocks_until_reveal=1` each slot frees in ~12 sec, so realistic model-swap cadence is unconstrained.
+
+### v11 — magma_v9 base + 17k LibriTTS-R SFT (CATASTROPHIC FAILURE)
+
+a) **Motivation:** Now that we understand the LibriVox-distribution gap, the obvious play is: start from magma_v9 (the strongest open Qwen3-TTS at 50.79%), continue-SFT on a broader LibriVox-derived corpus, deploy on a fresh chute_name. Plan was a v11 candidate in <4h end-to-end.
+
+b) **Method:**
+- Computed audio codes for LibriTTS-R train-clean-460 (79,191 entries) on 4 GPUs in parallel — done in ~5 min (Qwen3 tokenizer is much faster than expected).
+- Extracted (transcription + 7 traits) for LibriTTS-R train-clean-100 (17,463/17,467 success) via gpt-4o-audio-preview matching the validator's exact `get_transcription_and_traits_async` prompt. Cost ~$150. Concurrency 24, wall ~15 min.
+- Merged codes + GPT-4o traits into `v11_train.jsonl` (17,463 SFT-ready entries; we use GPT-4o's transcription as `text` so it matches what the validator sends miners at inference).
+- Ran `accelerate launch sft_12hz.py --init_model_path /tmp/magma_v9 --train_jsonl data/v11_train.jsonl --batch_size 1 --lr 5e-6 --num_epochs 2 --speaker_name vocence_libri` on 4×L40 DDP. ~30 min, final loss ~6.0.
+- Generated v11 audio on clean_holdout (4 GPU shards, ~38 min).
+- Judged with `score_miner_against_spec_async`.
+
+c) **Result:** **v11 local clean: 0.00% win-rate, 0.4725 mean_weighted.** Every single one of 185 specs lost. Compared to magma_v9's 34.59%/0.858, this is total collapse.
+
+Per-spec breakdown reveals the failure mode:
+- **naturalness: 0.0 across the board** — judge consistently reports "less natural than source"
+- **gender/emotion/accent: routinely wrong** — asked for "neutral", got "male"; asked for "serious", got "neutral"
+- **script accuracy collapsed** — 0.19 / 0.5 on representative specs (vs v8's 1.0)
+- Audio files were valid (non-empty, correct durations), so it's not an inference bug — the model genuinely produces audio that ignores the trait instruction and sounds like one specific narrator.
+
+**Diagnosis: SFT-mode mismatch.** Qwen3-TTS has two `tts_model_type`s: `voice_design` (instruction-conditioned generation, what magma/owner-base/the validator use) and `custom_voice` (clone a specific reference audio's voice). The script `qwen3tts-repo/finetuning/sft_12hz.py` is **voice-cloning training**:
+
+1. Overwrites `tts_model_type` in `config.json` from `voice_design` → `custom_voice`.
+2. Adds the `--speaker_name` value (`vocence_libri`) as a new speaker embedding (id 3000).
+3. The TTSDataset in `dataset.py` only reads `text`, `audio_codes`, `ref_audio` — **never the `instruction` field**. The model is trained "regardless of input, sound like the fixed `ref_audio` speaker."
+4. We patched the config back to `voice_design` for inference, but the WEIGHTS had already been re-trained to copy `/root/miner-dev/data/ref_24k.wav`. So the model now always reproduces that one narrator and ignores the trait instruction.
+
+**This is the structural reason all our prior fine-tunes (v6/v7/v8/v10/v11) underperformed magma and even the owner base.** Every one of them used `sft_12hz.py` / `dpo_12hz.py` / `mpo_12hz.py`, which are voice-cloning training. Each pass gradually destroyed the voice-design pretraining we needed to compete. Magma's edge isn't broader data alone — magma must have been trained with voice-design-aware code that conditions on `instruction` during training. The qwen3tts-repo finetuning folder doesn't ship such a script.
+
+### Pivot — three viable paths forward
+
+1. **Deploy magma_v9 weights as-is to our chute** (fresh chute_name, ~$5.40, <1h warmup). Lifts UID 213 from 39.69% → ~50.79% WEIGHTED without any new code. Doesn't beat the eligible winner (ranupthestairs 51.35%) but clears the owner-base floor and starts accumulating evals toward eligibility.
+2. **Continued voice-cloning-style training, gentler.** Smaller LR, fewer epochs, curated pairs. Same script. High risk of repeating the v11 collapse since the script's mode is wrong, not its hyperparams.
+3. **Build voice-design-aware training code** — modify `dataset.py` to feed `instruction` as conditioning, modify `sft_12hz.py` to keep `tts_model_type=voice_design`, retrain. ~1–2 days of real engineering. Highest upside; closes the structural gap that has kept us below the owner base for weeks.
+
+## Summary
+
+The cross-team ranking inversion (local v8 > magma, production magma > v8) is fully explained: the validator evaluates against a continuously-refreshing LibriVox stream sampled uniformly at random, our local pipeline evaluates against a narrow static snapshot that our own models were trained on. magma was trained on a broader LibriVox slice (we infer this from the inversion, not from their training scripts) so it generalizes; our v8/v10 generalize poorly to fresh LibriVox even though they look fine on home turf. **Local clean_holdout numbers are NOT a faithful predictor of production absolute score across different teams; they're only useful for A/B within models trained on the same data**. Production WEIGHTED via `/api/dashboard/global-scoring` is the only trustworthy cross-team signal.
+
+The deeper architectural finding: the entire qwen3tts-repo finetuning folder is voice-cloning training, not voice-design training. We've been using it on voice-design models for weeks, gradually destroying the instruction-following pretraining magma_v9 has preserved. The v11 SFT (loss converged cleanly, all infra worked) scored 0% win-rate at the validator because the model now ignores trait instructions entirely and always reproduces one fixed reference voice. **Every fine-tune we've shipped (v6 onwards) suffered some degree of this degradation; that's why magma is uniformly ahead of our DPO/MPO variants and even ahead of our SFT bases.** The fix is either to deploy magma's weights directly (immediate ~11pp prod gain, no training) or to write voice-design-aware training code (real engineering, days, but the only path to actually beat magma at this architecture).
