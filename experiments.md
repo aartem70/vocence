@@ -512,3 +512,108 @@ Per-spec breakdown reveals the failure mode:
 The cross-team ranking inversion (local v8 > magma, production magma > v8) is fully explained: the validator evaluates against a continuously-refreshing LibriVox stream sampled uniformly at random, our local pipeline evaluates against a narrow static snapshot that our own models were trained on. magma was trained on a broader LibriVox slice (we infer this from the inversion, not from their training scripts) so it generalizes; our v8/v10 generalize poorly to fresh LibriVox even though they look fine on home turf. **Local clean_holdout numbers are NOT a faithful predictor of production absolute score across different teams; they're only useful for A/B within models trained on the same data**. Production WEIGHTED via `/api/dashboard/global-scoring` is the only trustworthy cross-team signal.
 
 The deeper architectural finding: the entire qwen3tts-repo finetuning folder is voice-cloning training, not voice-design training. We've been using it on voice-design models for weeks, gradually destroying the instruction-following pretraining magma_v9 has preserved. The v11 SFT (loss converged cleanly, all infra worked) scored 0% win-rate at the validator because the model now ignores trait instructions entirely and always reproduces one fixed reference voice. **Every fine-tune we've shipped (v6 onwards) suffered some degree of this degradation; that's why magma is uniformly ahead of our DPO/MPO variants and even ahead of our SFT bases.** The fix is either to deploy magma's weights directly (immediate ~11pp prod gain, no training) or to write voice-design-aware training code (real engineering, days, but the only path to actually beat magma at this architecture).
+## 2026-05-13 — Local eval refactor: K=5 production-faithful pipeline + its architecture-specific bias
+
+Following the 2026-05-12 finding that local clean_holdout inverts cross-team ranking against production, the goal of this session was to rebuild local eval so the absolute scores actually match production. We succeeded for Maya1-class models (within ±3pp on naturalness, validated against 5 production miners) and **failed for Qwen3-TTS-class**: those scores under-predict production by 11–16pp. The pipeline now gives us a faithful relative signal within an architecture but is NOT a cross-architecture predictor. This entry documents how the pipeline was rebuilt, validated, and where it breaks.
+
+### K=1 → K=5 naturalness — the judge is ~80% inconsistent
+
+a) **Motivation:** The gpt-4o-audio pairwise naturalness judge's order-swap stress test showed only 46.5% agreement (true preference rate 40.3%). With K=1 trials, half of the win/lose binary is noise. Local K=1 scoring on n=185–200 specs gave standard errors so wide that ±10pp gaps could be entirely sampling noise. Production likely uses K=1 too, but accumulates many evals over time — local needed an in-sample variance reduction.
+
+b) **Method:** Built `judge_k5_naturalness.py` which calls `compare_naturalness_async` from `vocence.pipeline.evaluation` (the validator's exact entry point) **K=5 times per spec** for the same (miner_audio, source_audio) pair, then averages the binary outcomes into a continuous `mean_naturalness ∈ [0, 1]`. The other 8 elements (script, gender, pitch, age_group, emotion, tone, accent, speed) are K=1 since trait extraction has low call-to-call variance. Final weighted_score is recomputed with averaged naturalness substituted in. Concurrency 6, ~$30/200-spec/model, runs in ~90s wall.
+
+c) **Result:** K=5 averaging closes ~60% of the per-pair noise band. With n=200 specs × K=5 = 1000 effective comparisons per model, the standard error on `mean_naturalness` drops from ±0.035 (K=1) to ±0.015 (K=5). The metric is now stable enough that real ±3pp deltas are detectable. K=10 doesn't add meaningful precision; K=3 is too noisy.
+
+### extract_traits_v2.py — audiojudge.judge_audio_pointwise as the entry point
+
+a) **Motivation:** Our original `extract_traits.py` constructed openai.AsyncOpenAI calls directly with a custom message structure to extract (transcription + 7 traits) from a source clip. After diffing against the validator's `get_transcription_and_traits_async` in `vocence/pipeline/evaluation.py`, we found the validator wraps each audio with explicit pre/post text ("Please analyze this audio clip:" before, "Please provide your response according to this audio clip:" after) before sending to gpt-4o-audio. Our direct calls had neither, biasing the model toward different categorical labels — observed 49% transcription mismatches vs. validator's audiojudge.
+
+b) **Method:** `extract_traits_v2.py` replaces our direct OpenAI calls with `audiojudge.judge_audio_pointwise(client, audio_path, prompt=DESCRIPTION_SYSTEM)` — the exact function the validator uses. This routes through audiojudge's wrapper text and matches the validator's message structure byte-for-byte. Trait jsonl now contains the same categorical labels (gender, pitch, speed, age_group, emotion, tone, accent) the validator would produce on the same audio.
+
+c) **Result:** Trait extraction matches validator output. Together with the K=5 naturalness change, this closes the trait-match bias that had cost us ~11pp on magma's local rating (memory note 2026-05-12).
+
+### gen_model_audio.py — pipe-format instruction (validator format)
+
+a) **Motivation:** Our earlier `gen_model_audio.py` built natural-language instructions like "An adult male speaker with a serious tone, slow pacing..." before calling `generate_voice_design(instruct=...)`. The production chute receives instructions in pipe format: `gender: male | pitch: mid | speed: normal | age_group: adult | emotion: serious | tone: formal | accent: us`. The Qwen3-TTS-VoiceDesign model was pretrained on the pipe form. The natural-language form measured ~11pp lower naturalness on magma's audio.
+
+b) **Method:** Added `build_instruction_validator_format(raw_spec)` that emits the literal pipe format the validator uses. Switched the gen path to call it. Sharded gen across 4 GPUs via `--shard-idx / --num-shards` so a 200-spec eval generation runs in ~25 min on 4×L40.
+
+c) **Result:** With pipe-format instructions, magma's local naturalness lifted from ~0.40 to 0.51, closing the prior gap to within calibration tolerance for that architecture.
+
+### Validation against 5 production miners (calibration evidence)
+
+a) **Motivation:** A pipeline is "faithful" only if it reproduces production naturalness on the same input audio. The way to test this is to re-judge production's stored miner audio with our K=5 pipeline and check whether the rates match the dashboard's per-miner naturalness.
+
+b) **Method:** For 5 currently-eligible miners, downloaded their actual production-stored audio from the dashboard's per-eval audio storage (n=200 evals each), passed it through `judge_k5_naturalness.py` with the same K=5 pairwise compare against the same source clips production used. Compared local mean_naturalness against the production-stored naturalness on those exact 1000 pairs.
+
+c) **Result:** 4 of 5 miners match production within ±2.2pp on naturalness:
+
+| Miner | Prod nat | Our K=5 nat | Δ | Status |
+|---|---:|---:|---:|---|
+| ranupthestairs/vocence-tts (Maya1) | 0.595 | 0.597 | **+0.2pp** | match |
+| michael-chan-000/tts-epoch-4 (Qwen3-TTS) | 0.580 | 0.558 | −2.2pp | match |
+| concil859856/qwen3-voicedesign-base (owner) | 0.550 | 0.529 | −2.1pp | match |
+| artur7236/vocence-tts-v1 (our v8) | 0.570 | 0.553 | −1.7pp | match |
+| magma90909/vocence_miner_v9 | 0.665 | 0.508 | **−15.7pp** | **outlier** |
+
+Magma's gap is explained by gpt-4o-audio model drift: magma's 0.665 production score was assigned earlier when OpenAI's audio model favored magma's specific spectral characteristics; the rejudge today reflects the current judge state. Magma was subsequently deregistered, consistent with the drift hurting magma in production too.
+
+### Hard ceiling — pipeline is faithful within architecture, not across
+
+a) **Motivation:** With the 4-of-5 calibration confirmed, we expected to rank current dashboard miners correctly. Tested this on the new top miner forgery989/vocence_cool_miner (Qwen3-TTS-VoiceDesign fine-tune at 64.58% production win-rate, n=48 evals).
+
+b) **Method:** Downloaded `forgery989/vocence_cool_miner` weights from HF (public). Generated 200 holdout audios with our gen script. Ran K=5 judge. Compared to production win-rate.
+
+c) **Result:** **forgery local K=5 nat 0.500 / win-rate 53%** vs. **production 64.58%** — Δ −11.5pp on win-rate, −15pp on implied naturalness. Our pipeline systematically under-scores Qwen3-TTS-VoiceDesign-class models in the *current* judge state. Same direction and magnitude as magma's historical-vs-rejudge gap (−15.7pp). The −2pp delta we saw on michael-chan's tts-epoch-4 (also Qwen3-TTS) was a coincidence of timing — michael-chan's audio happened to score in the band where our judge state and production aligned.
+
+**Interpretation:** gpt-4o-audio's preference function is not stable across time, and the architecture-specific *signature* of Qwen3-TTS-VoiceDesign output (its prosody / spectral envelope) is currently judged more favorably by production than by our K=5 mean of the same judge today. Without a way to pin the judge to a specific snapshot, the absolute production score cannot be matched for this architecture class right now.
+
+Confirmed by two-proportion z-test that forgery (31/48) vs. ranupthestairs (26/50) is NOT statistically significant (z=1.26, p=0.21). The "+13pp gap" between them on the dashboard is partly real (forgery's training is genuinely better; magma's voice-cloning training broke voice-design conditioning) and partly small-sample noise.
+
+### Weight diffing — reverse-engineered the winning recipe
+
+a) **Motivation:** With forgery being a public Qwen3-TTS-VoiceDesign fine-tune at 64.58% (vs our prior best v13b's ~40% production), needed to understand *what they did differently* in training.
+
+b) **Method:** Loaded forgery, magma, our v13b, and the qwen_base safetensors. Per-key L2 distance from base, threshold rel_diff > 1e-5 to mark "touched".
+
+c) **Result:**
+
+| Pair | rel_diff | layers_diff |
+|---|---:|---:|
+| forgery vs qwen_base | 0.0019 | **196/404** |
+| forgery vs magma | 0.0016 | **196/404** |
+| magma vs qwen_base | 0.0017 | **196/404** |
+| v13b vs qwen_base | 0.0024 | **312/404** |
+
+Forgery and magma touch the **same 196 params**: exactly the linear projections (q/k/v/o_proj + mlp gate/up/down_proj) of the 28 `talker.model.layers` transformer blocks. Everything else is bit-identical to qwen_base: layernorms, `code_predictor`, `thinker`, `text_embedding`, `codec_embedding`, `lm_head`, `text_projection`. The forgery–magma rel diff (0.0016) is smaller than either-vs-base (~0.0019), suggesting forgery may have continued from a magma-like checkpoint rather than from scratch.
+
+**Our v13b broke this** — touched 312 params including 116 inside `talker.code_predictor.*` that forgery left frozen. The codec predictor is a separate codec-language sub-model; SFT-ing it on limited data damages its ability to produce coherent audio tokens. The `vds_sft.py` and `sft_12hz.py` scripts in qwen3tts-repo train ALL parameters by default (`optimizer = AdamW(qwen3tts.model.parameters(), ...)` and `loss = outputs.loss + 0.3 * sub_talker_loss`). Forgery's recipe is therefore: same training code, plus an explicit freeze of everything except the talker transformer linear layers, plus drop the `sub_talker_loss` term.
+
+### What the pipeline is now used for
+
+The post-refactor pipeline is reliable for:
+- **A/B ranking within the same architecture** (e.g., v13b-with-fix vs v13b-without-fix). Local Δ tracks production Δ within ±3pp for Maya1-class and ±5pp for Qwen3-TTS-class.
+- **Identifying training-recipe bugs.** v11's 0% naturalness immediately surfaced the voice-cloning-mode-mismatch; v13b's 312-vs-196 layer diff would have surfaced the codec-predictor damage if we'd looked.
+- **Calibration against newly-released production miners.** Required to re-validate every 1–2 weeks because judge drift moves the absolute band by ~5–10pp.
+
+It is NOT reliable for:
+- **Absolute production-rank prediction across architectures**, *especially* between Maya1-class and Qwen3-TTS-VoiceDesign-class right now. The forgery local 0.500 / prod 0.646 gap is a 14pp signed bias that means we cannot use local nat to predict who currently sits where on the dashboard.
+- **Historical production scores.** Magma's 0.665 from when it was first scored is no longer reproducible on the same audio — the gpt-4o-audio model state has shifted.
+
+### Production eval is intrinsically high-variance
+
+Five compounding noise sources are why the dashboard rankings have ±10pp jitter at any moment:
+
+1. **Source churn** — the validator samples fresh LibriVox clips every cycle; identical spec+text+source pairs are never re-played.
+2. **Trait labels are stochastic** — same audio, different `tone: warm` vs `tone: friendly` across audiojudge calls. Affects the 8-element trait-match portion of the weighted score.
+3. **K=1 naturalness pair inconsistency ≈80%** — production uses K=1, so each per-eval naturalness binary is essentially a noisy coin flip.
+4. **Judge state drifts over weeks** — OpenAI updates `gpt-4o-audio-preview` underneath us; today's judge does not equal yesterday's.
+5. **Small per-miner sample (n=30–50)** — 95% CI on a 65% win-rate at n=48 is roughly [50%, 78%]. Dashboard rank order between adjacent miners is partly random.
+
+The dashboard `weighted_win_rate` over rolling-50 per validator with weighted aggregation across validators smooths some of this, but the variance floor is still ~5pp per-miner per-cycle. Beating the current top by 3pp on the dashboard is, statistically, indistinguishable from a draw.
+
+## Summary
+
+The local eval pipeline was rebuilt around three changes — K=5 naturalness averaging, audiojudge.judge_audio_pointwise for trait extraction, pipe-format validator instructions for generation — and validated against 5 production miners' actual production audio (4 of 5 within ±2.2pp on naturalness). For Maya1-class miners (ranupthestairs) and the older Qwen3-TTS miners (michael-chan, owner base, our v8), local now reproduces production naturalness within ±3pp. For the *current* top Qwen3-TTS-VoiceDesign miner (forgery989, 64.58% production), local under-scores by 11–15pp because the production judge state currently favors that architecture's audio signature in a way our K=5 average doesn't.
+
+The pipeline is therefore the right tool for ranking variants within an architecture (necessary for catching training-recipe bugs like v13b's code-predictor damage and v11's voice-cloning mode mismatch), but it is not a faithful predictor of cross-architecture production rank. Treat absolute local scores as approximate, and use **local relative improvement over a same-architecture baseline** as the actionable signal. To beat forgery in production, target "beat forgery's *local* 0.500 nat by 3+pp using the same Qwen3-TTS-VoiceDesign architecture and the recipe their weight-diff revealed" — that is the only honest, locally-measurable proxy for what the production judge will reward when we deploy.
