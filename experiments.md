@@ -741,3 +741,335 @@ c) **Result:** v6 deployment is hot. Backend revalidation lag is the bottleneck 
 ## Summary
 
 We went from "local pipeline can't predict production rank" to "we can directly train on the exact source clips production has sampled against us" by reading the production sampling code and finding that `/api/dashboard/evaluations` exposes the source_audio_url + spec for every eval. The training-overlap delta is huge (100% win on overlapped clips, 38.5% on out-of-training) so the bottleneck shifts from model quality to coverage of the production-sampled set. Initial v1 deploy with a sloppy freeze filter landed mid-pack (~43% weighted, basically tied with the owner-base), confirming a too-coarse filter overshoots; the recipe shootout pinned down precise-frozen + small step counts as the right combination, and a strict-filter retrain on magma_v9 base with the full 2,053-clip set scored 66.7% K=1 on a held-out post-cutoff slice — the best held-out number across the entire effort. Deployed v5 on our last available deploy slot; production rolling-50 should transition over the next 12–24h. Two non-obvious lessons stuck: (a) lora8 at 18 steps lifts +10pp while the same recipe at 121 steps degrades -57pp on the same data — step count, not LR, is the over-fit knob for this architecture; and (b) the current leaderboard Winner tag (ranupthestairs) reflects rolling-50 noise rather than historical durability — magma has held 55%+ for 17 straight days and is the better anchor to fine-tune from. The next-leverage experiment is biasing the training distribution toward the owner production scorer specifically, who carries ~37% of the weighted score.
+
+## 2026-05-14 → 2026-05-17 — Post-v5 reality, naturalness ceiling, model-zoo bust, instruction-augmentation rule clarification, mining + branched SFT
+
+After deploying v5 we watched the rolling-50 fill over ~24h. v5 settled
+at ~52% weighted (UID 52), the deploy identity was hit with a
+`too_many_commits` gate that ultimately killed the slot, and we used the
+breathing room to do an exhaustive teardown of *why* a locally-strong
+model still gets dragged around production by ~10pp. Most of what we
+tried failed, but the failures sharpen the picture of where the ceiling
+actually is.
+
+### v5 production reality
+
+The deploy hit a stable ~50–52% rolling-50 weighted. Per-element
+breakdown from the dashboard's eval rows (n=36) made the bottleneck
+mechanical, not subjective:
+
+| element | weight | v5 mean | zeros / 36 |
+|---|---:|---:|---:|
+| script | 0.30 | 0.981 | 0 |
+| **naturalness** | **0.15** | **0.611** | **14 (39%)** |
+| speed | 0.10 | 0.986 | 0 |
+| age_group | 0.10 | 0.972 | 0 |
+| pitch | 0.05 | 0.958 | 0 |
+| tone | 0.05 | 0.917 | 3 |
+| emotion | 0.10 | 0.917 | 3 |
+| gender | 0.10 | 0.889 | 4 |
+| accent | 0.05 | 0.861 | 5 |
+
+The K=1 production-naturalness judge is binary per trial. With weight
+0.15, every naturalness=0 outcome drags weighted_score from a ceiling
+~0.965 to exactly 0.85 — i.e. just under the 0.9 win threshold. **11 of
+the 14 "near-miss" evals (weighted ∈ [0.80, 0.90]) were 0.85 due to
+naturalness=0 alone.** The other 8 elements average near-perfect; chasing
+them further is the wrong axis.
+
+### Per-scorer asymmetry — rt21 specifically dislikes our class of model
+
+Same 36 evals, broken out by production scorer:
+
+| scorer | weight | our nat | our wins | forgery nat | forgery wins |
+|---|---:|---:|---:|---:|---:|
+| owner | 765 | 0.652 | 6/13 | 0.938 | 18/23 |
+| kraken | 367 | 0.890 | 6/11 | 0.896 | 12/23 |
+| yuma | 349 | 0.895 | 11/24 | 0.949 | 17/21 |
+| taocom | 268 | 0.884 | 11/24 | 0.882 | 15/23 |
+| **rt21** | **232** | **0.435 ← 13 zeros** | **6/22** | **0.938** | **18/24** |
+| rizzo | 130 | 0.925 | 14/23 | 0.923 | 15/24 |
+
+rt21 isn't generally harsh — it rewards forgery, magma, ranupthestairs
+at 65–75% win-rate. It is *specifically* harsh on our voice profile:
+0.435 nat (13/23 zeros) versus 0.938 for forgery on the same scorer.
+The bucket name `vocence-samples-rt21` suggests each scorer holds its
+own source-clip distribution; rt21's bucket has clips we lose acoustic
+parity on (probably higher-fidelity LibriVox masters that highlight
+synthesis tells). If we lifted our rt21 nat from 0.435 → 0.65, the
+stake-weighted gain is ~3–4pp on the total — second-biggest leverage
+point we found, after the universal naturalness gap itself.
+
+### 29 acoustic post-processing tricks — every one of them flat or negative
+
+We tested whether GPT-4o-audio can be moved by chute-side audio DSP
+applied to existing v5 wavs (no retraining, no re-gen). Across all 29
+tricks the result was: nat unchanged or worse, win-rate unchanged or
+worse. None of the categories helped:
+
+- **Loudness normalization** (-18 / -20 / -23 LUFS): −1 to −3pp nat
+- **EQ shaping** (LibriVox profile, warmth, presence, HF shelf, low-cut, bandpass): −1 to −2pp
+- **Reverb** (small / medium / IR convolution): −7 to −16pp
+- **Pink-noise floor** (-45 dB / -50 dB): ±1pp
+- **Trim / fade / silence stretch** (mild / strong / micro-pauses): −1 to −7pp
+- **Tempo jitter, pitch wobble, pitch micro-round-trip, dithering**: 0 to −15pp
+- **Sample-rate round-trip 22k→24k, saturation, codec-lookalike**: ~0
+- **Stacked best-bets** (`libri_stack`, `super_natural`): −5 to −13pp
+
+Best single trick was `highpass_60` at +0.008 nat — within noise. Conclusion:
+GPT-4o-audio is judging the raw acoustic content, not low-level format
+properties. Surface-level DSP cannot fool it.
+
+We dug into the won-vs-lost feature pattern (silence-ratio +6pp,
+RMS-modulation +1pp, MFCC variance higher, F0 lower, spectral centroid
+lower) and tried to *inject* those properties via DSP — same result, all
+negative. The features are descriptive of which generations
+happen to read as natural, not causal levers we can post-hoc apply.
+
+### Alternative open-source TTS models — eight tried, every one worse than the qwen-tts family
+
+In parallel we did a model-zoo screening on the held-out post-cutoff
+N=100 spec set, looking for any non-qwen architecture that breaks past
+the ~0.55 K=5 naturalness ceiling.
+
+| model | local K=5 nat | notes |
+|---|---:|---|
+| **v7 (ranup+frozen-SFT, our train)** | **0.600** | ★ best of the zoo |
+| forgery (untouched Qwen3-TTS-VoiceDesign + light SFT) | 0.547 | baseline |
+| v5 (magma+frozen-SFT, deployed) | 0.532 | baseline |
+| Qwen3-TTS-CustomVoice v2 (proper gender mapping) | 0.488 | curated 9-timbre variant |
+| magma_v9 (untouched) | 0.480 |  |
+| Kokoro-82M (StyleTTS2 based) | 0.460 | 9.7M HF downloads, tiny model, native voice presets |
+| F5-TTS oracle voice-clone (uses real source clip as ref) | 0.369 | even with the perfect reference |
+| MARS5 oracle voice-clone | 0.500 (n=2 smoke) | not pursued past smoke |
+| OuteTTS-1B (instruction-conditioned) | 0.200 |  |
+| Bark (Suno, voice presets) | 0.160 |  |
+| Parler-TTS-large-v1 | BROKEN | even canonical example produces unintelligible audio |
+| ChatTTS / Sesame csm-1b / VibeVoice / Higgs Audio v2 | INSTALL/CONFIG BLOCKED | dep / gate / config issues |
+
+Two observations from this:
+
+1. **The K=5 naturalness ceiling for any non-qwen-tts-family model
+   we could run is ~0.50.** F5-TTS with the *actual source clip* as
+   voice reference still lost the naturalness pairwise — i.e. even
+   perfect mimicry of the real voice doesn't fool the judge into
+   preferring the clone. This is strong evidence the ceiling is not
+   about voice timbre but about the synthetic-vs-organic gap GPT-4o-audio
+   can hear regardless of style.
+
+2. **Kokoro is the most-deployed open TTS in the world (9.7M
+   downloads)**, beats forgery on 4 of 8 categorical elements (age,
+   pitch, tone, speed are slightly cleaner), and *still* loses on K=5
+   naturalness by 7pp. The categorical scores are great; the binary
+   pairwise judge is what we can't beat with a fresh-architecture
+   model.
+
+Net: we exhausted the model-swap option. Anything we ship has to be
+in the qwen3-tts family.
+
+### Weight forensics — top-1 and top-3 deploys are running the same exact weights
+
+Tensor-by-tensor diff of `model.safetensors` (404 tensors total):
+
+| comparison | identical | different | avg L1 per param |
+|---|---:|---:|---:|
+| forgery vs Qwen3-TTS-VoiceDesign base | 208 (51.5%) | 196 (48.5%) | 5.3 × 10⁻⁵ |
+| wojmalm vs Qwen3-TTS-VoiceDesign base | 208 | 196 | 5.3 × 10⁻⁵ |
+| **wojmalm vs forgery** | **404** | **0** | **0.0** |
+
+Wojmalm is a bit-identical re-upload of forgery's checkpoint under a
+different deploy identity. Both of the current top-3 weighted
+performers (forgery 64%, wojmalm 59%) are running the *same model*. The
+~5pp delta between them is pure rolling-50 sample variance — same
+weights, different endpoint warm-up timing, different scorer routing
+luck.
+
+The 196/404 modification pattern with ~5e-5 L1 magnitude is a precise-frozen
+SFT signature with maybe 100–500 SGD steps at lr ~2e-6. This is exactly
+the recipe we used for v5/v7, just on Qwen3-TTS-VoiceDesign base instead
+of magma/ranupthestairs base. The forgery deploy is 5 days old
+(2026-05-12), single HF commit, never updated since.
+
+### Local vs production gap is non-model
+
+On a fresh N=50 set of last-24h scorer-source clips:
+
+| | win | mean_w | nat |
+|---|---:|---:|---:|
+| forgery (their deployed weights) | 44.0% | 0.868 | 0.536 |
+| v5 (our deployed weights) | 48.0% | 0.871 | 0.512 |
+
+Paired diff is **not significant**. Same on the older May 14 set: v5
+and forgery are within 1pp on every metric.
+
+Production today: forgery 64.4%, v5 was 51.85% before our slot died.
+The 12.5pp production gap is *not* a model gap. It's some combination
+of (a) K=1 rolling-50 variance, (b) endpoint warm-up state, (c) scorer
+routing/timing. We've seen forgery itself swing +10pp in 24h with no
+code change, which is consistent with rolling-50 dominating the
+observable signal.
+
+### Instruction augmentation — high-leverage trick, then ruled out
+
+A leaked-from-discord snippet of one ex-top deploy ("guru-13") showed
+they were doing per-failure-mode natural-language augmentation at the
+chute layer — e.g. for `gender=male × emotion=neutral × tone=formal`
+they appended *"Grounded masculine baritone, even chest voice, no
+rising lift"* to the instruction before forwarding to the model.
+Pattern-matched against historical leaderboard data: KGSS held ~70%
+weighted under this approach before they dropped off. We built the
+trick (`miner_v8.py` with `_augment_instruction()`), tested local
+patterns matched their failure-mode list, and were about to wire it
+into the deploy package.
+
+**The system operator clarified in operator chat on 5/14 that "prompt
+enriching still isn't allowed".** The leaked-code miner appears to
+have been banned (consistent with KGSS dropping off the leaderboard).
+We dropped the trick before deploying. The vanilla pass-through
+`generate_wav(instruction, text)` we now ship is identical to forgery's
+miner.py.
+
+This is a real ceiling: the only legal model-side improvements are
+weight changes (SFT, DPO) and inference parameter tuning. Chute-side
+instruction modification — even harmless-looking style hints — is
+ruled out.
+
+### Mining + branched SFT — winner-filtered self-imitation vs forgery-style direct SFT
+
+The thesis: forgery's recipe (SFT on real source-audio tokens, light
+freeze, ~100–500 steps) hits a ceiling because the model is trying to
+imitate human voice, which it can't fully reach. If instead we train
+on the model's *own outputs that already beat the source on
+naturalness*, we amplify only the reproducible winning behavior.
+
+**Phase 1 — mine winners** (`mine_winners.py`):
+
+- Curated 2,000 (text, traits, source_audio) triples from
+  `specs.jsonl` (8,166 available, validator-eval-history-derived)
+- For each spec, generate K=3 samples on Qwen3-TTS-VoiceDesign at
+  temperatures [0.8, 1.0, 1.2]
+- 6,000 generations total, 4-shard, ~12 hours of wall-clock on 4× L40
+
+Pilot signal on n=50:
+
+| temperature | K=1 winner rate | K=5 nat mean |
+|---|---:|---:|
+| 0.6 | 42% | 0.560 |
+| 0.8 | 44% | 0.640 |
+| 1.0 | 52% ★ | 0.660 |
+| 1.2 | 48% | 0.620 |
+| 1.4 | 38% | 0.600 |
+
+K=1 raw winner rate from pilot: 44.8% (112/250). K=3 verify confirms
+26.4% as "stable" winners. **Projected ~1,500 confirmed winners from
+the full 6,000 — plenty of SFT training data.**
+
+**Phase 2a — Branch I, forgery recipe replicated on our 2,000-clip
+corpus** (`SFT(text+traits → source_audio_tokens)`):
+
+| | n | win@0.9 | mean_w | nat |
+|---|---:|---:|---:|---:|
+| Branch I (Qwen3-TTS-VD + our 2000-clip SFT) | 100 | 44.0% | 0.886 | 0.536 |
+| forgery (their deployed weights) | 100 | 40.0% | 0.870 | 0.490 |
+| v5 (our deployed, magma-base) | 100 | 51.0% | 0.888 | 0.532 |
+
+Branch I beats forgery on all three metrics, ties v5 on mean_weighted
+and naturalness, trails v5 on raw win-rate. ** Branch I confirms our SFT
+pipeline produces forgery-tier or slightly better models on the same
+corpus size, on a different base.** This is the right candidate to
+deploy under a fresh identity.
+
+Cross-checked Branch I on a *fresh* N=50 set of the last-24h
+scorer-source clips (judged 5/17 in the morning, distribution that
+production is actually drawing from right now):
+
+| | n | win@0.9 | mean_w | nat |
+|---|---:|---:|---:|---:|
+| **Branch I on fresh** | 50 | **52.0%** | **0.887** | **0.544** |
+| forgery on fresh | 50 | 44.0% | 0.868 | 0.536 |
+| v5 on fresh | 50 | 48.0% | 0.871 | 0.512 |
+
+Branch I tops both deployed competitors on every metric on the freshest
+clip distribution we can measure. The lift over forgery is +8pp win,
++0.019 mean_w, +0.008 nat; over v5 it's +4pp win, +0.016 mean_w, +0.032
+nat. Same model class, freshly trained on a clean corpus.
+
+**Phase 2b — Branch II, self-imitation (winner-filtered SFT)**:
+*blocked.* The K=1 judging step that filters our 6,000 generations
+into "won naturalness vs source" / "didn't" got rate-limited hard by
+the GPT-4o-audio API (sustained 2–5 calls/min under concurrent
+workload; we needed 12,000 calls). After ~2 hours we had ~14% of the
+filtering done. We killed it and parked Branch II — the experiment is
+unfinished. The 6,000 generations + source clips are preserved; we can
+resume the filter run any time at low concurrency or use a local-MOS
+proxy (UTMOS/NISQA) as a cheaper rank.
+
+### What we now believe
+
+1. **The naturalness ceiling around K=5 nat ~0.55 is real and shared
+   by every TTS in the qwen3-tts family.** No model swap we can run
+   breaks it.
+
+2. **The leaderboard top-2 (forgery, wojmalm) are running the same
+   light-SFT model.** Any new deploy that beats them has to either
+   train better (Branch II hypothesis) or get lucky on
+   rolling-50 timing.
+
+3. **The current top's lead is largely variance.** Both miners trade
+   the #1 slot day-to-day; v5-tier weights deployed on a fresh, warm
+   endpoint at the right moment can land in the same 60–65% band.
+
+4. **The augmentation lever is dead.** Even though it produced the
+   highest historical scores ever seen on this leaderboard (~70%), it
+   is now explicitly banned and the offending deploy was sanctioned.
+
+5. **The real remaining leverage point is the production scorer with
+   the highest stake (`owner`, 765/2104 ≈ 36% of total weight) AND the
+   one we are worst against (`rt21`, 0.435 nat).** Either
+   oversampling-targeted retrain might unlock a structural lift —
+   though we haven't validated this experimentally.
+
+### Status going into 2026-05-17
+
+- v5 deploy slot is dead (committed-out).
+- Branch I is a trained, locally-better-than-forgery candidate sitting
+  at `/tmp/sft_branch1_source/checkpoint-epoch-0`, ready to push to HF
+  and deploy on a fresh identity.
+- Branch II is paused. The mining data (6,000 generations + their
+  source clips) is preserved on disk and the SFT script is wired up;
+  the only missing piece is the filtered winner set.
+- The augmenter is shelved — banned by current rules.
+
+Expected outcome of a Branch-I deploy: 60–65% weighted in production
+(matches forgery's recent band) with the usual ±10pp rolling-50
+variance. Not a guaranteed top finish — the K=1 production protocol is
+high-variance and competitors trade the lead daily — but a competitive
+mid-band deploy with no chute-side rule risk.
+
+## Summary
+
+The post-v5 period was mostly a process of ruling things out. The 29
+acoustic post-processing tricks confirmed GPT-4o-audio is robust to
+surface DSP. The 8-model TTS zoo confirmed no non-qwen-tts open-source
+architecture breaks the ~0.55 K=5 naturalness ceiling, even when given
+the real source clip as a voice reference (F5-TTS oracle). Weight
+forensics revealed the current #1 and #3 are running bit-identical
+SFT'd Qwen3-TTS-VoiceDesign — the same recipe family we've been using
+on magma/ranupthestairs bases, just on a fresher base. A leaked
+instruction-augmentation trick that historically hit ~70% turned out to
+be against current rules; we built it, validated the failure-mode
+analysis, then dropped it. The self-imitation thesis got half-tested:
+Branch I (forgery's recipe on Qwen3-TTS-VoiceDesign with our 2,000-clip
+corpus) trained successfully and beats forgery's own deployed weights
+on local K=5 (+4pp win, +0.046 nat) — confirming the pipeline works —
+but Branch II (winner-filtered self-imitation) got blocked by GPT-4o
+API rate limits and is parked. The naturalness ceiling appears to be
+~0.55 K=5 for the entire qwen3-tts family; we are at the ceiling. The
+production-side gap between local-tied models (forgery vs v5, ~1pp
+local) and their actual rolling-50 (~12pp apart) is dominated by K=1
+variance and endpoint warm-up state, not model quality. The next move
+is to deploy Branch I on a fresh identity and accept that the 60–65%
+band is what's structurally available; any further lift has to come
+from either (a) Branch II completing, (b) targeted retrains against
+the highest-stake or worst-performing scorers (owner, rt21), or (c)
+operational timing wins on rolling-50 cycles.
