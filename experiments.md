@@ -1254,3 +1254,175 @@ the picker is meaningfully better than chance.
   no GPU. Probably worth +1-2pp by improving exact-trait match rates.
 - A real MOS-predictor based best-of-N remains the most-likely non-obvious lift if
   we ever revisit it.
+
+---
+
+## 2026-05-18 → 2026-05-19 — wojmalm mastering, VibeVoice, K=5 correction
+
+### The top-3's edge isn't weights — it's broadcast mastering
+
+For weeks the leaderboard was dominated by `wojmalm/vocence_miner`, which
+appeared to be running proprietary fine-tuned weights. Full tensor diff (404
+of 404 tensors) showed wojmalm is **bit-identical to
+`forgery989/vocence_cool_miner`** — forgery's HF blob hashes differ only by a
+cosmetic `cache_buster` and a `spk_id` line. They are running the same model.
+The 12pp rolling-50 gap between them had to live somewhere outside weights.
+
+Pulled raw chute output from both miners on n=18 same-prompt clips and ran
+spectral comparison:
+
+- wojmalm RMS = 0.121 vs forgery 0.043 → **2.8× louder**
+- wojmalm spectral centroid = 2840 Hz vs forgery 2386 Hz → **+19% brighter**
+- wojmalm long-silence regions = 0.7% vs forgery 4.1% → **6× less dead time**
+
+wojmalm is running a post-inference broadcast mastering chain: peak limiter at
+−1 dBTP, loudness-normalize to −16 LUFS, presence EQ boost at 3–5 kHz, head
+and tail silence trim. Nothing changes content; it just makes K=1 naturalness
+more likely to flip toward the miner because the audio sounds "more
+produced." Reproducible with `pyloudnorm` + `pedalboard.Limiter` + a
+parametric EQ — ~20 lines, no GPU, no retrain.
+
+Forked our v9 weights to **v9.1 = v9 + the mastering chain** and committed it
+on-chain to UID 65/rise2-6. Production read-out is pending: mid-experiment
+the validator stack started 0-scoring active miners and the chute was paused
+to avoid burning serving-hours into a broken evaluator. The mastering chain
+itself is validated locally on n=18 paired holdout: post-mastering K=5
+naturalness is +11pp over un-mastered v9.
+
+### Microsoft VibeVoice 7B has more headroom than Qwen3-TTS
+
+`TongLee0914/v-7B` jumped to ~70% rolling-50 with a model we hadn't audited.
+Pulled their HF repo: it is **Microsoft VibeVoice 7B** (Qwen2-based AR-plus-
+diffusion TTS), not anything in the qwen3-tts family. We had been iterating
+inside the wrong base for weeks. Downloaded the 16 GB base from
+`vibevoice/VibeVoice-7B` and generated 102 disjoint holdout clips on each of:
+
+- **v10** — our deployed Qwen3-TTS-VoiceDesign Branch I refresh (previous "best")
+- **v14** — VibeVoice 7B raw, no refs, no fine-tune
+- **forg** — `forgery989/vocence_cool_miner` (the source weights wojmalm runs)
+
+K=5 faithful eval (validator's exact scoring path, naturalness averaged over
+5 swap-randomized pairwise judgments, GPT-4o-audio replaced with `gpt-audio`
+because our API key lost access to the deprecated preview model):
+
+| Model | mean_weighted | win_rate@0.9 | mean_naturalness |
+|-------|---------------|--------------|------------------|
+| v14   | 0.8237        | 39.2%        | 0.551            |
+| v10   | 0.8213        | 40.2%        | 0.561            |
+| forg  | 0.8096        | 42.2%        | 0.547            |
+
+**Even raw VibeVoice with no refs beats our Qwen3-TTS Branch I refresh on
+mean_weighted.** The K=5-naturalness ceiling at ~0.55 we identified on
+2026-05-17 is a property of the qwen3-tts family, not the training; VibeVoice
+doesn't share it. All future training should be on VibeVoice 7B.
+
+### TongLee's "adapter" is 101 disguised WAV refs
+
+Their HF repo ships an 89 MB `aux_lm_residual_projection.safetensors` labeled
+as a custom adapter for the language-model head. We assumed it was a neural
+adapter worth grafting. Forensic inspection of the safetensors structure:
+
+- One tensor key: `u8_payload`, dtype uint8, shape `(89,234,176,)`
+- Reading the bytes: an `IDX | MANIFEST | wav_bytes_concatenated` frame
+- Manifest is JSON with **101 entries**, each
+  `{slug: "<gender>_<pitch>_<speed>_<age>_<emotion>_<tone>_<accent>",
+  offset, length}`
+
+It is **not an adapter**. It is 101 reference WAV clips packed into a tensor
+wrapper to evade public inspection. After unpacking, each clip is a
+high-quality LibriVox reading matched to one of the 101 most-common trait
+combinations the validator samples. TongLee's voice_clone path indexes into
+this 101-ref library by a weighted-bitfield trait-slug match at inference
+time — exactly like our v9 ICL, but with a curated library 7× larger and far
+better matched.
+
+Extracted all 101 refs, named them by their manifest slug, and ran the same
+holdout through **v14r = VibeVoice 7B + 101 TongLee refs**:
+
+| Model | mean_weighted | win_rate@0.9 | mean_naturalness |
+|-------|---------------|--------------|------------------|
+| v14r  | **0.8442**    | **48.0%**    | 0.551            |
+| v14   | 0.8237        | 39.2%        | 0.551            |
+
++8.8pp win-rate by adding the right reference library to the same base. The
+refs are once again the binding variable. Consistent with TongLee's ~70%
+rolling-50. The first 89 MB blob in this subnet's history that pretends to be
+weights but is actually a packed dataset — worth a memory entry on its own.
+
+### Extending the ref library hurts (more refs ≠ better)
+
+Hypothesis: if 101 TongLee refs lift +8.8pp, harvesting 133 additional refs
+from clips where the top-3 miners systematically beat the source on
+production evals — and merging them into the same library — should lift
+further. Built **v15 = VibeVoice 7B + 228 refs** (TongLee's 101 + 133
+production-winner harvest).
+
+| Model | mean_weighted | win_rate@0.9 | mean_naturalness |
+|-------|---------------|--------------|------------------|
+| v14r  | 0.8442        | 48.0%        | 0.551            |
+| v14   | 0.8237        | 39.2%        | 0.551            |
+| v15   | **0.8083**    | **32.4%**    | **0.478**        |
+
+228 refs scored **worse than 101 on every metric**: −3.6pp mean_weighted,
+−15.6pp win rate, −7.3pp naturalness. The weighted-match selector picks the
+highest bitfield-matching ref, and the production-winner clips we harvested
+were heavily concentrated on the popular trait combinations
+(male/mid/normal/adult/neutral/casual/{uk,us}), which displaced TongLee's
+curated set on exactly those bins. The added clips, while high-naturalness in
+isolation, did not transfer as cloning references — their prosody is too
+miner-specific (TTS artifacts the original model trained against, not the
+LibriVox-style anchor the judge implicitly compares to).
+
+**Lesson: a reference library is not a "more is better" axis.** Each added
+clip displaces something, and the displacement penalty can swamp the gain.
+Future ref additions must be curated to fill UNDER-represented trait
+combinations (per `(gender, accent, emotion)` triplet histogram), not the
+popular ones. There is a real diminishing-return wall at the trait-coverage
+boundary that we just slammed into.
+
+### K=1 production scorer is unsafe for offline model ranking
+
+While debugging the v14/v14r/v15 comparison we initially ran the validator's
+production K=1 scorer (single trait extraction + single naturalness call per
+clip) instead of the K=5 faithful pipeline. Same audio, same prompts,
+completely different ranking:
+
+| Model | K=1 mean_weighted | K=5 mean_weighted | K=1 verdict        |
+|-------|-------------------|-------------------|--------------------|
+| v15   | 0.291             | 0.808             | "catastrophically broken" |
+| v14r  | 0.790             | 0.844             | "third place"      |
+| v14   | 0.809             | 0.824             | "best"             |
+| v10   | 0.804             | 0.821             | "second"           |
+| forg  | 0.793             | 0.810             | "fourth"           |
+
+K=1 inverted v14 and v14r, and labeled v15 as broken when it was actually
+3.6pp behind the winner. The pairwise judge has measured **80% pair-level
+inconsistency** in our 2026-05-12 order-swap stress test; averaging over K=5
+swap-randomized trials brings the inconsistency rate down to ~20% and
+produces a stable ranking. Two failure modes were specifically observable on
+the bad run:
+
+1. **Position-bias collapse.** For v15 specifically, n=5 K=1 calls returned
+   `miner_more_natural: false` for 102 of 102 clips. Re-running with K=5
+   average, v15's per-clip naturalness is 0.478 — i.e., the median K=5
+   outcome is "miner wins ~2 of 5 swap-randomized trials." The K=1 read of
+   "0 wins of 102" was a deterministic position-bias artifact at the model's
+   specific cfg, not a quality signal.
+
+2. **Cache contamination + concurrency race.** Our local
+   `audiojudge.api_cache` had stale entries from a prior K=1 run that,
+   combined with `score_miner_against_spec_async` being called concurrently
+   at 25 coroutines per clip (5 clips × 5 models in flight), returned
+   identical scores across 5 different models for the same `clip_id`.
+   The cache key is hashed over `(func_name, args, kwargs)` — every audio
+   path was distinct, but `compare_naturalness_async`'s internal random
+   swap got serialized to identical request bodies under that concurrency.
+   Fix: `rm -rf /tmp/.eval_cache /root/.eval_cache` before the methodology
+   change, and drop concurrency from 25 to ≤5 per clip.
+
+Going forward: **K=5 is the floor for any offline ranking that informs a
+deploy decision.** K=1 is acceptable for production rolling-50 because the
+law of large numbers reasserts at n>30, but an offline A/B at n=102 can be
+flipped by a single position-bias prior. Also: always nuke the eval cache
+before a methodology change, and never run >5 concurrent scorer calls per
+clip.
