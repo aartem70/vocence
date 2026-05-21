@@ -1426,3 +1426,203 @@ law of large numbers reasserts at n>30, but an offline A/B at n=102 can be
 flipped by a single position-bias prior. Also: always nuke the eval cache
 before a methodology change, and never run >5 concurrent scorer calls per
 clip.
+
+---
+
+## 2026-05-19 (cont.) — Three follow-ups: LoRA on VibeVoice, mastering transfer, and a score-pipeline audit
+
+### Experiment 1: LoRA fine-tune on VibeVoice 7B (v16)
+
+**Motivation.** v14r (VibeVoice 7B + 101 TongLee refs) won our K=5 head-to-head
+at 0.8442 mean_weighted / 48% pass-rate, but it's a *tie* with TongLee, who runs
+the same base + same refs. To break the tie we hypothesized that a small
+audio-aware LoRA on the language model component, trained on the v14r outputs
+the K=5 judge already preferred, would shift the prosody distribution slightly
+toward the judge's anchor and yield a structural lift.
+
+**Method.**
+- Base model: `vibevoice/VibeVoice-7B`.
+- Training rows: 144 K=5-naturalness-winners from v14r holdout outputs.
+- LoRA targets: `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` on
+  `model.language_model`. Trainable params = 392 (196 A + 196 B).
+- Hyperparams: 8 epochs (288 effective steps at grad_accum=4),
+  `lr=2.5e-5`, linear schedule, `warmup_ratio=0.1`, `max_grad_norm=0.8`.
+- Diffusion head also trained:
+  `--train_diffusion_head True --diffusion_loss_weight 1.4 --ce_loss_weight 0.04`.
+- `voice_prompt_drop_rate=0.2`.
+- Hardware: 1×L40, ~13 min runtime. Final `train_loss 2.54`,
+  `ce_loss 12.19 → 4.81` (real learning signal).
+- Inference: same 101 TongLee refs and same weighted-bitfield trait-slug
+  matching as v14r. Generated 102 holdout clips, K=5 faithful eval.
+
+**Result.**
+
+| Model | mean_weighted | win_rate@0.9 | mean_naturalness |
+|---|---|---|---|
+| v14r (no LoRA) | **0.8442** | **48.0%** | **0.551** |
+| v16 (+ LoRA) | 0.8138 | 38.2% | 0.524 |
+| Δ | **−3.0pp** | **−9.8pp** | **−2.7pp** |
+
+LoRA regressed v14r on every metric. Trait scores moved barely at all (the
+LM-tokens are preserved); the loss landed on naturalness (−2.7pp), which then
+cascaded into the win-rate.
+
+**Diagnosis.** Three compounding causes, in descending likely contribution:
+1. **Train/inference mode mismatch.** LoRA was trained in VibeVoice's
+   `voice_design` path (text-to-speech from scratch). Evaluation is in
+   `voice_clone` mode conditioned on one of the 101 refs. The two paths share
+   the LM and diffusion head but use different conditioning; the LoRA-shifted
+   prosody bias fights the ref's prosody anchor at inference.
+2. **Saturated base + small data.** Same pattern as 2026-05-17 Branch II
+   self-imitation (114 samples, no lift). VibeVoice already sits near the
+   K=5-naturalness ceiling on this prompt distribution; 290 small-gradient
+   steps drift away from the local optimum without enough signal to push back
+   toward judge preference.
+3. **Diffusion-head update.** `--train_diffusion_head True` with
+   `diffusion_loss_weight 1.4` and `ce_loss_weight 0.04` means ~97% of the
+   gradient signal updated the prosody-synthesis head. 290 steps on
+   miner-specific training audio teaches it our training set's prosody, not
+   the LibriVox anchor the judge implicitly compares to.
+
+**Takeaway.** LoRA fine-tunes on small (<1000 sample) curated training sets
+don't transfer past a saturated base. To make LoRA work on VibeVoice we'd need
+(a) rejection-sampling SFT filtered by K=5 wins with 1000+ samples (~$300
+OpenAI), AND (b) freeze the diffusion head entirely. Otherwise deploy v14r and
+harvest refs continuously.
+
+---
+
+### Experiment 2: Broadcast mastering chain on v14r output
+
+**Motivation.** wojmalm's broadcast mastering recipe (loudness norm + limiter +
+presence EQ + silence trim) lifted our v9 K=5 naturalness by +11pp on n=18
+paired holdout (2026-05-18). v14r is tied with TongLee, who does not master.
+If wojmalm-style mastering transfers to VibeVoice-quality output, stacking it
+on v14r gives the first deploy that combines both known top-miner tricks.
+
+**Method.** Two mastering chains, both implemented with `pyloudnorm` +
+`pedalboard`, applied to v14r's 102-clip holdout:
+
+| Variant | Loudness target | Limiter | EQ | Silence trim |
+|---|---|---|---|---|
+| v14rm v1 (aggressive) | −16 LUFS | −1 dBTP brick wall, release 50 ms | +3 dB peak at 4 kHz, Q=0.7 | top_db=40 |
+| v14rm v2 (gentle) | −18 LUFS | −3 dB soft, release 200 ms | none | top_db=50 |
+
+K=5 faithful eval on both, then compared against the unmastered v14r baseline.
+
+**Result.**
+
+| Variant | mean_weighted | win_rate@0.9 | mean_nat | RMS ratio vs raw |
+|---|---|---|---|---|
+| v14r (no mastering) | **0.8442** | **48.0%** | **0.551** | 1.0× (raw RMS 0.061) |
+| v14rm v1 (aggressive) | 0.8274 | 40.2% | 0.490 | 3.39× |
+| v14rm v2 (gentle) | 0.8255 | 40.2% | 0.549 | 3.77× |
+
+Both variants regressed. The interesting finding is in v2: naturalness fully
+recovered (0.549 ≈ 0.551 baseline), but mean_weighted still dropped −1.9pp.
+**Trait extraction degraded** — GPT-audio's pointwise classifier (gender,
+pitch, speed, age, emotion, tone, accent) mis-parsed the dynamics-compressed
+audio even when the naturalness judge couldn't perceive a difference.
+
+Spectral centroid only shifted +2.5% on the aggressive v1 chain (versus
+wojmalm's measured +19% on Qwen3-TTS audio). VibeVoice's output is already in
+the brighter regime; the EQ boost has nowhere meaningful to go.
+
+**Diagnosis.** wojmalm's +11pp lift on v9 worked because Qwen3-TTS Branch I
+output is quiet (RMS ~0.04) and dull, so adding loudness + presence pushes it
+into the "produced" regime the K=1 naturalness judge implicitly rewards.
+VibeVoice already produces audio in that regime, so mastering only introduces
+inter-sample distortion and compression artifacts. Those artifacts are
+inaudible-or-nearly-so to the pairwise naturalness judge but visible to the
+pointwise trait classifier.
+
+**Takeaway.** Broadcast mastering does NOT transfer to VibeVoice-quality
+output. The "stack both top-miner tricks" strategy is rejected. Any future
+audio post-processing on VibeVoice needs to be far gentler than the wojmalm
+recipe, or skipped entirely.
+
+---
+
+### Experiment 3: Reverse-engineering the score-submission pipeline
+
+**Motivation.** On 2026-05-19, TongLee and magma alleged on the operator
+Discord that forgery is hijacking validator scores via direct owner-postgres
+access — not via model quality. If true, this reframes the leaderboard:
+forgery's historical top-tier rank is not a model-quality signal worth
+reverse-engineering, and any optimization decision that uses it as ground
+truth is biased. We needed to determine, from public code alone, whether such
+an attack is plausible — before either pursuing more model improvements or
+alerting the operator.
+
+**Method.** Static review of the open-source operator stack
+(`vocence-78/vocence` on GitHub):
+- Score submission path:
+  `vocence/gateway/http/service/endpoints/evaluations.py`
+- Signature verification:
+  `vocence/gateway/http/service/auth/signature.py`
+- DB schema and table layouts:
+  `vocence/registry/persistence/schema.py`
+- Dashboard win-rate computation:
+  `vocence/registry/persistence/repositories/evaluation_repository.py:177`
+  (`compute_miner_stats_by_validator_recent`)
+- Config defaults:
+  `vocence/domain/config.py:143-148`
+
+No active probing of the operator's production infra was performed.
+
+**Result.** Four findings:
+
+1. **The signed-API path is solid.** `verify_validator_signature` enforces
+   SS58 keypair signature + 8-128-char nonce + timestamp-freshness window +
+   validator-registry membership check + per-hotkey LRU replay protection.
+   No plausible bypass on the API surface.
+
+2. **The default postgres password is the empty string.**
+   `vocence/domain/config.py:147`:
+   ```python
+   POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
+   ```
+   If the production deploy did not override this env var, postgres is open
+   on user `vocence`, db `vocence`, port 5432.
+
+3. **No row-level signatures on evaluations.** The `validator_evaluations`
+   table (`schema.py:92`) stores `validator_hotkey` as a plain string with no
+   cryptographic binding. The signed-API path properly verifies signatures
+   *before* INSERT, but at read time DB-direct INSERTs are indistinguishable
+   from API-inserted rows.
+
+4. **The dashboard aggregates live with no re-verification.**
+   `compute_miner_stats_by_validator_recent` runs
+   ```sql
+   SELECT miner_hotkey, COUNT(*), SUM(wins::int)
+   FROM validator_evaluations
+   WHERE validator_hotkey = ? AND evaluation_id IN (recent_100)
+   GROUP BY miner_hotkey;
+   ```
+   Any row in the table counts toward win_rate.
+
+**Conclusion.** Direct-postgres-write is the attack vector if (a) the postgres
+password is the empty default, (b) port 5432 is internet-reachable, and (c)
+`pg_hba.conf` accepts non-localhost connections. All three are operator-side
+configuration choices; whether forgery actually exploited them is an empirical
+question only Space can answer (`echo $POSTGRES_PASSWORD`,
+`ss -tlnp | grep 5432`, `cat /etc/postgresql/*/main/pg_hba.conf`). Findings
+shared with Space for him to verify/patch on his own infrastructure.
+
+**Recommended patches** (in priority order):
+- Rotate `POSTGRES_PASSWORD` to a strong random value; bind postgres to
+  `127.0.0.1` or the owner LAN; require `scram-sha-256` auth in pg_hba.conf.
+- Add `signature TEXT NOT NULL` and `signed_nonce TEXT NOT NULL` columns to
+  `validator_evaluations`. Have the API write these on INSERT. Recompute
+  win_rate only over rows whose signature verifies against the row's
+  `validator_hotkey`.
+- Long term: each evaluation row should be a self-verifiable signed claim —
+  `signature = sign(validator_privkey, sha256(evaluation_id || miner_hotkey
+  || wins || score || evaluated_at))`. Replay resistance follows from
+  `evaluation_id` uniqueness. DB tampering then becomes detectable on read.
+
+**Takeaway.** Our local K=5 model rankings remain authoritative for model
+quality — they don't touch the operator's backend. v14r at 0.8442
+mean_weighted is real. But dashboard rankings above ~30% rolling-50 may not
+reflect fair scoring until the patch lands. Defer the v14r deploy decision
+until the leaderboard's integrity is restored.
